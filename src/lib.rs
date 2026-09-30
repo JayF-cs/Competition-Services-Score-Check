@@ -251,6 +251,7 @@ impl ScoreChecker {
         let outer = t0 + CHECK_TIMEOUT;
         let until = outer - DIAG_MARGIN;
 
+
         let op = async {
             Self::navigate(&page, &format!("http://{}/login.php", svc.host)).await?;
 
@@ -274,7 +275,6 @@ impl ScoreChecker {
             )
             .await
             {
-
                 dump_failure(&page, TAG).await;
                 return Err(e);
             }
@@ -328,8 +328,14 @@ impl ScoreChecker {
             )
             .await?;
 
-            if let Err(e) =
-                Self::wait_for_selector(&page, "#root-action-UserAction", until).await
+            // Positive + negative: we're off the login page, the login form is gone,
+            // and a Jenkins-authenticated-page marker is present.
+            if let Err(e) = Self::wait_for_js(
+                &page,
+                "location.pathname !== '/login' && !document.querySelector('input[name=\"j_username\"]') && !!document.querySelector('#breadcrumb-menu, .jenkins-breadcrumbs, .jenkins-header')",
+                until,
+            )
+            .await
             {
                 dump_failure(&page, TAG).await;
                 return Err(e);
