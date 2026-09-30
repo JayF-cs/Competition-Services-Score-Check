@@ -17,6 +17,7 @@ const CDP_HOST: &str = "http://127.0.0.1:9222";
 
 const CHECK_TIMEOUT: Duration = Duration::from_millis(4000);
 
+const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
 
 const DIAG_MARGIN: Duration = Duration::from_millis(400);
 
@@ -203,25 +204,17 @@ impl ScoreChecker {
         until: Instant,
     ) -> anyhow::Result<chromiumoxide::element::Element> {
         loop {
-
-            match tokio::time::timeout_at(until, page.find_element(selector)).await {
-                Ok(Ok(el)) => return Ok(el),
-                Ok(Err(e)) => {
-                    if Instant::now() >= until {
-                        return Err(anyhow::anyhow!("timed out waiting for {selector}: {e}"));
-                    }
-
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
-                Err(_) => {
-                    return Err(anyhow::anyhow!(
-                        "timed out waiting for {selector} (CDP call never returned)"
-                    ));
-                }
+            let now = Instant::now();
+            if now >= until {
+                anyhow::bail!("timed out waiting for {selector}");
             }
+            let attempt = std::cmp::min(until, now + ATTEMPT_TIMEOUT);
+            if let Ok(Ok(el)) = tokio::time::timeout_at(attempt, page.find_element(selector)).await {
+                return Ok(el);
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
-
 
     async fn wait_for_js(
         page: &chromiumoxide::Page,
@@ -229,22 +222,28 @@ impl ScoreChecker {
         until: Instant,
     ) -> anyhow::Result<()> {
         loop {
-            match tokio::time::timeout_at(until, page.evaluate(expr)).await {
-                Ok(Ok(r)) => {
-                    if r.into_value::<bool>().unwrap_or(false) {
-                        return Ok(());
-                    }
-                }
-                Ok(Err(_)) => {}
-                Err(_) => {
-                    anyhow::bail!("timed out waiting for js (evaluate never returned): {expr}");
-                }
-            }
-            if Instant::now() >= until {
+            let now = Instant::now();
+            if now >= until {
                 anyhow::bail!("timed out waiting for js: {expr}");
+            }
+            let attempt = std::cmp::min(until, now + ATTEMPT_TIMEOUT);
+            if let Ok(Ok(r)) = tokio::time::timeout_at(attempt, page.evaluate(expr)).await {
+                if r.into_value::<bool>().unwrap_or(false) {
+                    return Ok(());
+                }
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
+    }
+
+    async fn wait_for_present(
+        page: &chromiumoxide::Page,
+        selector: &str,
+        until: Instant,
+    ) -> anyhow::Result<()> {
+        let sel = serde_json::to_string(selector)?;
+        let expr = format!("!!document.querySelector({sel})");
+        Self::wait_for_js(page, &expr, until).await
     }
 
     pub async fn web_app(&self, svc: &Service) -> bool {
@@ -346,8 +345,6 @@ impl ScoreChecker {
             )
             .await?;
 
-            // Positive + negative: we're off the login page, the login form is gone,
-            // and a Jenkins-authenticated-page marker is present.
             if let Err(e) = Self::wait_for_js(
                 &page,
                 "location.pathname !== '/login' && !document.querySelector('input[name=\"j_username\"]') && !!document.querySelector('#breadcrumb-menu, .jenkins-breadcrumbs, .jenkins-header')",
@@ -404,7 +401,10 @@ impl ScoreChecker {
             Self::navigate(&page, &format!("http://{}/auth", svc.host)).await?;
             eprintln!("[{TAG}] navigated: {:?}", t0.elapsed());
 
-            Self::wait_for_selector(&page, "input[type='email']", until).await?;
+            if let Err(e) = Self::wait_for_present(&page, "input[type='email']", until).await {
+                dump_failure(&page, TAG).await;
+                return Err(e);
+            }
             eprintln!("[{TAG}] form mounted: {:?}", t0.elapsed());
 
             let fill_js = r#"
@@ -441,9 +441,7 @@ impl ScoreChecker {
             let logged_in = if OPEN_WEBUI_FAST_PASS {
                 Self::wait_for_js(&page, "!!localStorage.getItem('token')", until).await
             } else {
-                Self::wait_for_selector(&page, "#chat-input", until)
-                    .await
-                    .map(|_| ())
+                Self::wait_for_present(&page, "#chat-input", until).await
             };
 
             if let Err(e) = logged_in {
