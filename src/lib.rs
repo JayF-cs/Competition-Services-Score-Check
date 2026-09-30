@@ -7,6 +7,10 @@ use mysql_async::{prelude::*, Conn, OptsBuilder};
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::Instant;
+use russh::client::{self, Handle};
+use russh::ChannelMsg;
+use async_trait::async_trait;
+use russh_keys::key::PublicKey;
 
 const CDP_HOST: &str = "http://127.0.0.1:9222";
 
@@ -56,6 +60,20 @@ impl Service {
             Some(u) => Ok((u.username.as_str(), u.password.as_str())),
             None => anyhow::bail!("service config has no `user` block (is a user list set?)"),
         }
+    }
+}
+
+struct Client;
+
+#[async_trait]
+impl client::Handler for Client {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
     }
 }
 
@@ -472,6 +490,55 @@ pub async fn mysql_check(svc: &Service) -> bool {
         if value != Some(1) {
             anyhow::bail!("SELECT 1 returned {value:?}");
         }
+        anyhow::Ok(())
+    })
+    .await;
+
+    report(TAG, t0, result)
+}
+
+pub async fn ssh_check(svc: &Service) -> bool {
+    const TAG: &str = "ssh";
+    let (username, password) = match svc.creds() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[{TAG}] {e}");
+            return false;
+        }
+    };
+
+    let t0 = Instant::now();
+    let result = tokio::time::timeout(CHECK_TIMEOUT, async {
+        let config = std::sync::Arc::new(client::Config::default());
+        let mut session = client::connect(config, (svc.host.as_str(), 22), Client).await?;
+
+        let auth = session.authenticate_password(username, password).await?;
+
+        if !auth {
+            anyhow::bail!("password rejected");
+        }
+
+        let mut channel = session.channel_open_session().await?;
+        channel.exec(true, "echo ok").await?;
+
+        let mut out = Vec::new();
+        let mut code = None;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { ref data } => out.extend_from_slice(data),
+                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                _ => {}
+            }
+        }
+
+        if code != Some(0) {
+            anyhow::bail!("remote command exit status {code:?}");
+        }
+
+        let _ = session
+            .disconnect(russh::Disconnect::ByApplication, "", "")
+            .await;
+
         anyhow::Ok(())
     })
     .await;

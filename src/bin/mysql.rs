@@ -11,7 +11,6 @@ async fn main() -> ExitCode {
         }
     };
 
-    // No browser involved, so no connection to Chrome here.
     if mysql_check(&svc).await {
         ExitCode::SUCCESS
     } else {
