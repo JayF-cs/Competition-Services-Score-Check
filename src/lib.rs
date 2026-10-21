@@ -1,21 +1,26 @@
+use async_trait::async_trait;
 use chromiumoxide::browser::Browser;
 use chromiumoxide::cdp::browser_protocol::browser::BrowserContextId;
 use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
 use chromiumoxide::cdp::browser_protocol::target::{CreateBrowserContextParams, CreateTargetParams};
+use chromiumoxide::Page;
 use futures::StreamExt;
 use mysql_async::{prelude::*, Conn, OptsBuilder};
-use serde::Deserialize;
-use std::time::Duration;
-use tokio::time::Instant;
 use russh::client::{self, Handle};
 use russh::ChannelMsg;
-use async_trait::async_trait;
 use russh_keys::key::PublicKey;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::time::Duration;
+use tokio::time::Instant;
 
 const CDP_HOST: &str = "http://127.0.0.1:9222";
 
-
 const CHECK_TIMEOUT: Duration = Duration::from_millis(4000);
+
+// web_app does login + dashboard relay wait + API + extra page loads, so it
+// gets a longer budget. Make sure your scoring engine's own deadline allows it.
+const WEB_APP_TIMEOUT: Duration = Duration::from_millis(9000);
 
 const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -23,11 +28,108 @@ const DIAG_MARGIN: Duration = Duration::from_millis(400);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-
 const OPEN_WEBUI_FAST_PASS: bool = true;
 
-
 const MYSQL_DB: &str = "plinkcom";
+
+// ---------------------------------------------------------------------------
+// Web app baseline (known-good state). Matches the dashboard you pasted.
+// ---------------------------------------------------------------------------
+
+pub struct WebExpect {
+    pub title_suffix: String,
+    pub org_name: String,
+    pub header_text: String,
+    pub footer_text: String,
+    pub banner: String,
+    pub rocket_name: String,
+    pub vehicle_id: String,
+    pub destination_label: String,
+    pub dest_x: i64,
+    pub dest_y: i64,
+    pub formation_mode: String,
+    pub formation_center: Value,
+    pub formation_radius: i64,
+    pub control_points: Value,
+    pub cycle_seconds: i64,
+}
+
+impl Default for WebExpect {
+    fn default() -> Self {
+        Self {
+            title_suffix: "// TESTING".into(), // set to your real suffix
+            org_name: "INTERNATIONAL HORSE PLINKO LEAGUE".into(),
+            header_text: "LUNAR OPERATIONS DIVISION".into(),
+            footer_text: "IHPL LUNAR OPERATIONS DIVISION".into(),
+            banner: "IHPL LUNAR OPERATIONS // PROCEED TO MARE IMBRIUM".into(),
+            rocket_name: "Equus I".into(),
+            vehicle_id: "PLK-EQUUS-I-01".into(),
+            destination_label: "Moon / Mare Imbrium".into(),
+            dest_x: 880,
+            dest_y: 230,
+            formation_mode: "transit".into(),
+            formation_center: json!({"x": 620, "y": 330}),
+            formation_radius: 130,
+            control_points: json!([{"x": 480, "y": 120}, {"x": 730, "y": 120}]),
+            cycle_seconds: 1800,
+        }
+    }
+}
+
+/// Pages red team can flip to "Down for maintenance" (or a custom message).
+/// The selector must exist ONLY on the healthy page. Never match the
+/// maintenance text, because red team controls it.
+const GATED_PAGES: &[(&str, &str)] = &[
+    // The upload form itself: only present when the page is actually serving.
+    ("attachments.php", "form[enctype='multipart/form-data'] input[type='file'][name='attachment']"),
+    // The table header and search box exist whether or not the DB has rows,
+    // so this checks the page is up, not what's in the table.
+    ("cargo.php", "table.data-table thead"),
+];
+
+const DOM_JS: &str = r#"
+(() => {
+  const t = s => (document.querySelector(s)?.textContent || '').replace(/\s+/g, ' ').trim();
+  return JSON.stringify({
+    title:      document.title,
+    org:        t('.topbar__identity .eyebrow'),
+    header:     t('.topbar__title'),
+    footer:     t('.footer__host'),
+    banner:     t('[data-relay-banner]'),
+    rocket:     t('.mission-hero__identity h1'),
+    vehicle:    t('.mission-hero__identity span'),
+    dest:       t('[data-destination]'),
+    relay:      t('[data-relay-status]'),
+    render:     t('[data-render-status]'),
+    has_scene:  !!document.querySelector('#orbital3d'),
+    has_canvas: !!document.querySelector('.orbital3d-canvas canvas')
+  });
+})()
+"#;
+
+// Synchronous XHR so we don't depend on how Page::evaluate handles promises.
+// It reuses the logged-in session cookie.
+const API_JS: &str = r#"
+(() => {
+  try {
+    const x = new XMLHttpRequest();
+    x.open('GET', '/api/mission-map.php?mission_id=1', false);
+    x.send();
+    let body = null;
+    try { body = JSON.parse(x.responseText); } catch (e) {}
+    return JSON.stringify({status: x.status, body: body});
+  } catch (e) {
+    return JSON.stringify({status: 0, body: null, error: String(e)});
+  }
+})()
+"#;
+
+const RELAY_SETTLED_JS: &str = r#"
+(() => {
+  const t = (document.querySelector('[data-relay-status]')?.textContent || '').trim();
+  return t !== '' && !t.includes('ACQUIRING');
+})()
+"#;
 
 // ---------------------------------------------------------------------------
 // Service config (the JSON file the agent passes as argv[1])
@@ -83,7 +185,7 @@ impl client::Handler for Client {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-async fn debug_shot(page: &chromiumoxide::Page, name: &str) {
+async fn debug_shot(page: &Page, name: &str) {
     use chromiumoxide::page::ScreenshotParams;
     if let Ok(bytes) = page
         .screenshot(ScreenshotParams::builder().full_page(true).build())
@@ -93,7 +195,7 @@ async fn debug_shot(page: &chromiumoxide::Page, name: &str) {
     }
 }
 
-async fn dump_failure(page: &chromiumoxide::Page, tag: &str) {
+async fn dump_failure(page: &Page, tag: &str) {
     let url = page.url().await.ok().flatten();
     eprintln!("[{tag}] failed, current URL: {url:?}");
     if let Ok(html) = page.content().await {
@@ -142,6 +244,32 @@ async fn get_ws_endpoint(base: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no webSocketDebuggerUrl in /json/version response"))
 }
 
+/// Run JS that returns a JSON string and parse it.
+async fn eval_json(page: &Page, js: &str) -> anyhow::Result<Value> {
+    let s = page.evaluate(js).await?.into_value::<String>()?;
+    Ok(serde_json::from_str(&s)?)
+}
+
+/// `fails` are scoring; `warns` are logged only.
+#[derive(Default)]
+struct Findings {
+    fails: Vec<String>,
+    warns: Vec<String>,
+}
+
+impl Findings {
+    fn check(&mut self, name: &str, ok: bool, detail: impl FnOnce() -> String) {
+        if !ok {
+            self.fails.push(format!("{name}: {}", detail()));
+        }
+    }
+    fn soft(&mut self, name: &str, ok: bool, detail: impl FnOnce() -> String) {
+        if !ok {
+            self.warns.push(format!("{name}: {}", detail()));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Browser-based checks
 // ---------------------------------------------------------------------------
@@ -149,6 +277,7 @@ async fn get_ws_endpoint(base: &str) -> anyhow::Result<String> {
 pub struct ScoreChecker {
     browser: Browser,
     ctx: BrowserContextId,
+    expect: WebExpect,
 }
 
 impl ScoreChecker {
@@ -174,14 +303,18 @@ impl ScoreChecker {
             .create_browser_context(CreateBrowserContextParams::default())
             .await?;
 
-        Ok(Self { browser, ctx })
+        Ok(Self {
+            browser,
+            ctx,
+            expect: WebExpect::default(),
+        })
     }
 
     pub async fn close(self) {
         let _ = self.browser.dispose_browser_context(self.ctx).await;
     }
 
-    async fn new_page(&self, url: &str) -> anyhow::Result<chromiumoxide::Page> {
+    async fn new_page(&self, url: &str) -> anyhow::Result<Page> {
         let params = CreateTargetParams::builder()
             .url(url)
             .browser_context_id(self.ctx.clone())
@@ -190,7 +323,7 @@ impl ScoreChecker {
         Ok(self.browser.new_page(params).await?)
     }
 
-    async fn navigate(page: &chromiumoxide::Page, url: &str) -> anyhow::Result<()> {
+    async fn navigate(page: &Page, url: &str) -> anyhow::Result<()> {
         let resp = page.execute(NavigateParams::new(url)).await?;
         if let Some(err) = &resp.result.error_text {
             anyhow::bail!("navigation to {url} failed: {err}");
@@ -199,7 +332,7 @@ impl ScoreChecker {
     }
 
     async fn wait_for_selector(
-        page: &chromiumoxide::Page,
+        page: &Page,
         selector: &str,
         until: Instant,
     ) -> anyhow::Result<chromiumoxide::element::Element> {
@@ -216,11 +349,7 @@ impl ScoreChecker {
         }
     }
 
-    async fn wait_for_js(
-        page: &chromiumoxide::Page,
-        expr: &str,
-        until: Instant,
-    ) -> anyhow::Result<()> {
+    async fn wait_for_js(page: &Page, expr: &str, until: Instant) -> anyhow::Result<()> {
         loop {
             let now = Instant::now();
             if now >= until {
@@ -236,14 +365,112 @@ impl ScoreChecker {
         }
     }
 
-    async fn wait_for_present(
-        page: &chromiumoxide::Page,
-        selector: &str,
-        until: Instant,
-    ) -> anyhow::Result<()> {
+    async fn wait_for_present(page: &Page, selector: &str, until: Instant) -> anyhow::Result<()> {
         let sel = serde_json::to_string(selector)?;
         let expr = format!("!!document.querySelector({sel})");
         Self::wait_for_js(page, &expr, until).await
+    }
+
+    // -----------------------------------------------------------------------
+    // web_app: login, then tampering checks
+    // -----------------------------------------------------------------------
+
+    async fn tampering_checks(
+        &self,
+        page: &Page,
+        host: &str,
+        until: Instant,
+    ) -> anyhow::Result<Findings> {
+        let exp = &self.expect;
+        let mut f = Findings::default();
+
+        // ---- Dashboard DOM (already logged in) ----
+        // Give the relay poll a short window to overwrite the server-rendered
+        // banner. If it never settles, skip the DOM banner check (the API
+        // check below covers it) instead of failing the whole run.
+        let relay_until = std::cmp::min(until, Instant::now() + Duration::from_secs(5));
+        let relay_ok = Self::wait_for_js(page, RELAY_SETTLED_JS, relay_until).await.is_ok();
+        f.soft("relay_settled", relay_ok, || "relay status never left ACQUIRING".into());
+
+        let dom = eval_json(page, DOM_JS).await?;
+        let s = |k: &str| dom[k].as_str().unwrap_or("").to_string();
+
+        f.check("title_suffix", s("title").ends_with(&exp.title_suffix), || s("title"));
+        f.check("org_name", s("org") == exp.org_name, || s("org"));
+        f.check("header_text", s("header") == exp.header_text, || s("header"));
+        f.check("footer_text", s("footer").contains(&exp.footer_text), || s("footer"));
+        if relay_ok {
+            f.check("banner_dom", s("banner").contains(&exp.banner), || s("banner"));
+        }
+        f.check("rocket_dom", s("rocket") == exp.rocket_name, || s("rocket"));
+        f.check("dest_dom", s("dest") == exp.destination_label, || s("dest"));
+        f.check("vehicle_line", s("vehicle").contains(&exp.destination_label), || s("vehicle"));
+
+        // ---- 3D map availability (lives on the dashboard) ----
+        f.check("map_present", dom["has_scene"] == true, || "#orbital3d missing".into());
+        // Soft until you've confirmed WebGL renders in your headless Chrome.
+        // If it does, change this to f.check.
+        f.soft("map_canvas", dom["has_canvas"] == true, || {
+            format!("no canvas; render status: {}", s("render"))
+        });
+
+        // ---- API state (flight pattern, destination, clock, fleet) ----
+        let api = eval_json(page, API_JS).await?;
+        f.check("api_status", api["status"] == 200, || api["status"].to_string());
+        let cfg = &api["body"]["configuration"];
+
+        f.check("banner_api", cfg["banner"].as_str().unwrap_or("").contains(&exp.banner),
+            || cfg["banner"].to_string());
+        f.check("destination_label", cfg["destination"]["label"] == exp.destination_label.as_str(),
+            || cfg["destination"].to_string());
+        f.check("destination_xy",
+            cfg["destination"]["x"] == exp.dest_x && cfg["destination"]["y"] == exp.dest_y,
+            || cfg["destination"].to_string());
+
+        // Flight pattern
+        f.check("formation_mode", cfg["formation"]["mode"] == exp.formation_mode.as_str(),
+            || cfg["formation"].to_string());
+        f.check("formation_center", cfg["formation"]["center"] == exp.formation_center,
+            || cfg["formation"]["center"].to_string());
+        f.check("formation_radius", cfg["formation"]["radius"] == exp.formation_radius,
+            || cfg["formation"]["radius"].to_string());
+        f.check("control_points", cfg["control_points"] == exp.control_points,
+            || cfg["control_points"].to_string());
+        f.check("cycle_seconds", cfg["cycle_seconds"] == exp.cycle_seconds,
+            || cfg["cycle_seconds"].to_string());
+
+        // Injected scene content (assumes baseline has none)
+        for k in ["objects", "phantoms", "image_objects"] {
+            f.check(k, cfg[k].as_array().map_or(false, |a| a.is_empty()), || cfg[k].to_string());
+        }
+
+        // Rockets and fleet overrides
+        let rockets = api["body"]["rockets"].as_array().cloned().unwrap_or_default();
+        f.check("rocket_name_api", rockets.iter().any(|r| r["name"] == exp.rocket_name.as_str()),
+            || format!("{rockets:?}"));
+        f.check("vehicle_id",
+            rockets.iter().any(|r| r["vehicle_identifier"] == exp.vehicle_id.as_str()),
+            || format!("{rockets:?}"));
+        for (id, ov) in cfg["fleet_overrides"].as_object().into_iter().flatten() {
+            f.check("fleet_override_name", ov["name"] == exp.rocket_name.as_str(),
+                || format!("rocket {id}: {ov}"));
+            f.check("fleet_override_dest", ov["destination"] == exp.destination_label.as_str(),
+                || format!("rocket {id}: {ov}"));
+        }
+
+        // ---- Clock (WIP: non-scoring warnings only) ----
+        f.soft("clock_offset", cfg["clock_offset_seconds"] == 0,
+            || cfg["clock_offset_seconds"].to_string());
+        f.soft("clock_rate", cfg["clock_rate"] == 1, || cfg["clock_rate"].to_string());
+
+        // ---- Service availability (navigates away, so keep this last) ----
+        for (path, healthy_sel) in GATED_PAGES {
+            Self::navigate(page, &format!("http://{host}/{path}")).await?;
+            let up = Self::wait_for_selector(page, healthy_sel, until).await.is_ok();
+            f.check(&format!("availability:{path}"), up, || "maintenance/missing".into());
+        }
+
+        Ok(f)
     }
 
     pub async fn web_app(&self, svc: &Service) -> bool {
@@ -265,9 +492,8 @@ impl ScoreChecker {
             }
         };
 
-        let outer = t0 + CHECK_TIMEOUT;
+        let outer = t0 + WEB_APP_TIMEOUT;
         let until = outer - DIAG_MARGIN;
-
 
         let op = async {
             Self::navigate(&page, &format!("http://{}/login.php", svc.host)).await?;
@@ -285,6 +511,7 @@ impl ScoreChecker {
             page.evaluate("document.querySelector(\"button[type='submit']\").click()")
                 .await?;
 
+            // Login + post-login destination
             if let Err(e) = Self::wait_for_selector(
                 &page,
                 "a.nav__item.is-active[href='/dashboard.php']",
@@ -296,6 +523,16 @@ impl ScoreChecker {
                 return Err(e);
             }
 
+            // Tampering checks
+            let findings = self.tampering_checks(&page, &svc.host, until).await?;
+            for w in &findings.warns {
+                eprintln!("[{TAG}] warn: {w}");
+            }
+            if !findings.fails.is_empty() {
+                dump_failure(&page, TAG).await;
+                anyhow::bail!("tampering detected: {}", findings.fails.join("; "));
+            }
+
             anyhow::Ok(())
         };
 
@@ -304,6 +541,10 @@ impl ScoreChecker {
         let _ = page.close().await;
         report(TAG, t0, result)
     }
+
+    // -----------------------------------------------------------------------
+    // jenkins
+    // -----------------------------------------------------------------------
 
     pub async fn jenkins(&self, svc: &Service) -> bool {
         const TAG: &str = "jenkins";
@@ -363,6 +604,10 @@ impl ScoreChecker {
         let _ = page.close().await;
         report(TAG, t0, result)
     }
+
+    // -----------------------------------------------------------------------
+    // open_webui
+    // -----------------------------------------------------------------------
 
     pub async fn open_webui(&self, svc: &Service) -> bool {
         const TAG: &str = "open_webui";
@@ -494,6 +739,10 @@ pub async fn mysql_check(svc: &Service) -> bool {
 
     report(TAG, t0, result)
 }
+
+// ---------------------------------------------------------------------------
+// SSH check
+// ---------------------------------------------------------------------------
 
 pub async fn ssh_check(svc: &Service) -> bool {
     const TAG: &str = "ssh";
