@@ -1,4 +1,4 @@
-# scores_check
+# Score Checks for Blue Team Competition Services
 
 Service checks for the PLINKCOM (International Horse Plinko League, Lunar Operations) scoring engine. Each check is a small standalone binary that takes a JSON config file, tests one service, and reports pass/fail through its exit code. Written in Rust on top of `tokio`.
 
